@@ -1,0 +1,714 @@
+
+library(caret)
+library(mice)
+library(Boruta)
+library(glmnet)
+library(dplyr)
+
+set.seed(123)
+
+
+raw_data <- read.csv("YOUR_TRAINING_DATA_FILE.csv")
+
+raw_data <- raw_data[!is.na(raw_data$Death), ]
+
+
+raw_data$Death <- factor(raw_data$Death)
+
+
+stopifnot(!any(is.na(raw_data$Death)))
+stopifnot(nlevels(raw_data$Death) == 2)
+
+
+idx <- createDataPartition(raw_data$Death, p = 0.7, list = FALSE)
+train_df <- raw_data[idx, ]
+valid_df <- raw_data[-idx, ]
+
+
+# --- training set ---
+meth_train <- make.method(train_df)
+meth_train["Death"] <- ""   # 明确不插补结局变量
+
+imp_train <- mice(
+  train_df,
+  method = meth_train,
+  m = 5,
+  maxit = 5,
+  seed = 123,
+  printFlag = FALSE
+)
+train_df <- complete(imp_train, 1)
+
+# --- validation set ---
+meth_valid <- make.method(valid_df)
+meth_valid["Death"] <- ""
+
+imp_valid <- mice(
+  valid_df,
+  method = meth_valid,
+  m = 1,
+  maxit = 5,
+  seed = 123,
+  printFlag = FALSE
+)
+valid_df <- complete(imp_valid, 1)
+
+
+stopifnot(sum(is.na(train_df[, setdiff(names(train_df), "Death")])) == 0)
+stopifnot(sum(is.na(valid_df[, setdiff(names(valid_df), "Death")])) == 0)
+stopifnot(!any(is.na(train_df$Death)))
+stopifnot(!any(is.na(valid_df$Death)))
+
+
+response <- "Death"
+predictors <- setdiff(names(train_df), response)
+
+
+
+
+set.seed(123)
+
+boruta_fit <- Boruta(
+  as.formula(paste(response, "~", paste(predictors, collapse = "+"))),
+  data = train_df,
+  maxRuns = 1000
+)
+
+boruta_features <- getSelectedAttributes(
+  boruta_fit,
+  withTentative = FALSE
+)
+
+print(boruta_features)
+
+
+
+x <- model.matrix(as.formula(paste(response, "~", paste(predictors, collapse = "+"))), train_df)[, -1]
+y <- as.numeric(train_df[[response]])
+
+lasso_fit <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+lasso_coef <- coef(lasso_fit, s = "lambda.min")
+lasso_features <- rownames(lasso_coef)[lasso_coef[,1] != 0]
+lasso_features <- setdiff(lasso_features, "(Intercept)")
+
+
+common_features <- intersect(boruta_features, lasso_features)
+stopifnot(length(common_features) > 0)
+
+
+train_df$Death <- factor(
+  train_df$Death,
+  levels = c(0, 1),
+  labels = c("No", "Yes")
+)
+
+valid_df$Death <- factor(
+  valid_df$Death,
+  levels = c(0, 1),
+  labels = c("No", "Yes")
+)
+
+
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+auc_results <- data.frame(Num_Features = integer(), CV_AUC = numeric())
+
+for (k in seq_along(common_features)) {
+  feats <- common_features[1:k]
+  form <- as.formula(paste(response, "~", paste(feats, collapse = "+")))
+  
+  rf_fit <- train(
+    form,
+    data = train_df,
+    method = "rf",
+    metric = "ROC",
+    trControl = ctrl
+  )
+  
+  auc_results <- rbind(
+    auc_results,
+    data.frame(Num_Features = k, CV_AUC = max(rf_fit$results$ROC))
+  )
+}
+
+best_k <- auc_results$Num_Features[which.max(auc_results$CV_AUC)]
+best_features <- common_features[1:best_k]
+
+print(best_features)
+
+
+library(dplyr)
+library(recipes)
+library(readxl)
+
+
+train_data <- na.omit(train_df)
+
+
+train_data$Death <- factor(train_data$Death)
+
+
+test_data <- na.omit(valid_df)
+
+
+test_data$Death <- factor(valid_df$Death)
+
+binary_vars <- c("IMV", "Noninvasive.ventilation", "Vasoactive.drug")
+train_data[binary_vars] <- lapply(train_data[binary_vars], function(x) as.integer(as.character(x)))
+
+
+print(table(train_data$Death))
+
+# ================================
+# 2. 设置 SMOTE 参数
+# ================================
+# 计算阳性比例
+pos_ratio <- sum(train_data$Death == "Yes") / nrow(train_data)
+target_pos_ratio <- 0.2
+
+# 计算 over_ratio
+over_ratio <- round(target_pos_ratio / (1 - target_pos_ratio), 2)
+cat("设置的 over_ratio:", over_ratio, "\n")
+
+# ================================
+# 3. SMOTE + Tomek Links 处理
+# ================================
+recipe_obj <- recipe(Death ~ ., data = train_data) %>%
+  step_smote(Death, over_ratio = over_ratio) %>%  # SMOTE 过采样
+  step_tomek(Death) %>%                           # 移除 Tomek Links
+  prep(training = train_data)
+
+train_data_balanced <- bake(recipe_obj, new_data = NULL)
+
+
+train_data_balanced <- train_data_balanced %>%
+  mutate(across(all_of(binary_vars), ~ ifelse(. > 0.5, 1, 0)))
+
+
+train_data_balanced$Death <- factor(train_data_balanced$Death)
+
+
+print(table(train_data_balanced$Death))
+
+
+print(unique(train_data_balanced$IMV))
+print(unique(train_data_balanced$Noninvasive.ventilation))
+print(unique(train_data_balanced$Vasoactive.drug))
+
+str(train_data_balanced)
+
+
+
+e_pancreatitis <- read_excel("YOUR_TRAINING_DATA_FILE.xlsx")
+validate_data <- e_pancreatitis
+
+intersection_corrected <- c("Leukocyte.count", "Vasoactive.drug", "Hospital.stay", "Noninvasive.ventilation","IMV")
+
+train_smote_selected <- train_data_balanced[, c(intersection_corrected, "Death")]
+train_data_selected <- train_data[, c(intersection_corrected, "Death")]
+test_data_selected <- test_data[, c(intersection_corrected, "Death")]
+validate_data_selected <- validate_data[, c(intersection_corrected, "Death")]
+
+
+
+train_X_selected <- train_smote_selected[, -which(names(train_smote_selected) == "Death")]
+train_Y_selected <- factor(train_smote_selected$Death, levels = c("No","Yes"))
+
+train_X <- train_data_selected[, -which(names(train_data_selected) == "Death")]
+train_Y <- factor(train_data_selected$Death, levels = c("No","Yes"))
+
+test_X_selected <- test_data_selected[, -which(names(test_data_selected) == "Death")]
+test_Y_selected <- factor(test_data_selected$Death, levels = c("No","Yes"))
+
+validate_X_selected <- validate_data_selected[, -which(names(validate_data_selected) == "Death")]
+validate_Y_selected <- factor(validate_data_selected$Death, levels = c("No","Yes"))
+
+
+train_df <- train_smote_selected
+test_df  <- test_data_selected
+valid_df <- validate_data_selected
+
+
+
+train_df$Death <- factor(ifelse(train_df$Death == 1 | train_df$Death == "Yes", "Yes", "No"),
+                         levels = c("No", "Yes"))
+
+
+test_df$Death <- factor(ifelse(test_df$Death == 1 | test_df$Death == "Yes", "Yes", "No"),
+                        levels = c("No", "Yes"))
+
+valid_df$Death <- factor(ifelse(valid_df$Death == 1 | valid_df$Death == "Yes", "Yes", "No"),
+                         levels = c("No", "Yes"))
+
+cat("Train Death distribution:\n"); print(table(train_df$Death))
+cat("Test Death distribution:\n"); print(table(test_df$Death))
+cat("Valid Death distribution:\n"); print(table(valid_df$Death))
+
+
+
+train_df$Death <- factor(train_df$Death, levels = c("No", "Yes"))
+test_df$Death  <- factor(test_df$Death, levels = c("No", "Yes"))
+valid_df$Death <- factor(valid_df$Death, levels = c("No", "Yes"))
+
+response <- "Death"
+
+
+
+
+
+library(caret)
+set.seed(1234)
+
+ctrl <- trainControl(
+  method = "cv", 
+  number = 10, 
+  classProbs = TRUE, 
+  summaryFunction = twoClassSummary,
+  verboseIter = TRUE
+)
+
+
+rf_grid <- expand.grid(
+  mtry = seq(3, floor(sqrt(length(intersection_corrected)) * 1.5), by = 1)  
+)
+
+
+rf_model <- train(
+  as.formula(paste(response, "~", paste(intersection_corrected, collapse = "+"))),
+  data = train_df,
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneGrid = rf_grid,
+  ntree = 2000,           
+  importance = TRUE,
+  nodesize = 15,          
+  maxnodes = 100          
+)
+
+
+print(rf_model$bestTune)
+
+
+
+print(rf_model)
+
+
+gbm_model <- train(as.formula(paste(response, "~", paste(intersection_corrected, collapse = "+"))), 
+                   data = train_df, method = "gbm", trControl = ctrl, metric = "ROC", verbose = FALSE)
+
+
+glm_model <- train(as.formula(paste(response, "~", paste(intersection_corrected, collapse = "+"))), 
+                   data = train_df, method = "glmnet", trControl = ctrl, metric = "ROC",
+                   preProcess = c("center", "scale"),
+                   tuneGrid = expand.grid(alpha = 1, lambda = 10^(-4)))
+
+
+
+library(pROC)
+set.seed(123)
+
+
+library(caret)
+library(e1071)
+tune_grid <- expand.grid(sigma = seq(0.05, 0.5, length = 5), 
+                         C = seq(0.5, 2, length = 5))
+
+
+svm_model <- train(as.formula(paste(response, "~", paste(intersection_corrected, collapse = "+"))), 
+                   data = train_df, method = "svmRadial", 
+                   trControl = ctrl, metric = "ROC", 
+                   tuneGrid = tune_grid)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+library(nnet)
+
+
+
+
+ann_model <- train(as.formula(paste(response, "~", paste(intersection_corrected, collapse = "+"))), 
+                   data = train_df, method = "nnet", trControl = ctrl, metric = "ROC", trace = FALSE)
+
+
+
+dt_model <- train(
+  Death ~ .,
+  data = train_df,
+  method = "rpart",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneGrid = expand.grid(cp = seq(0.005, 0.05, length = 10)),  # 增大cp范围
+  control = rpart.control(
+    maxdepth = 20,   
+    minsplit = 20, 
+    minbucket = 10  
+  )
+) 
+
+
+dataXY_train_selected <- train_df[, intersection_corrected]
+
+
+dataXY_train_selected <- dataXY_train_selected %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm=T), .)))
+
+
+y_var <- "Death"
+label <- as.numeric(factor(train_df[[y_var]])) - 1  # 0/1 转换
+
+
+dataX <- as.matrix(dataXY_train_selected)
+
+
+set.seed(123)
+
+
+dtrain <- xgb.DMatrix(dataX, label = label)
+
+best_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 10,               
+  eta = 0.01,                 
+  gamma = 0.5,                 
+  colsample_bytree = 0.8,      
+  subsample = 0.8,             
+  min_child_weight = 8,       
+  lambda = 5.0,                
+  alpha = 2.0,                 
+  tree_method = "hist",
+  grow_policy = "lossguide",
+  max_leaves = 50,             
+  max_bin = 128                
+)
+
+
+xgb_cv <- xgb.cv(
+  params = best_params,
+  data = dtrain,
+  nrounds = 3000,              
+  nfold = 10,
+  stratified = TRUE,
+  metrics = "auc",
+  early_stopping_rounds = 150,  
+  print_every_n = 10
+)
+
+
+
+best_nround <- xgb_cv$best_iteration
+
+
+xgb_model <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = best_nround
+)
+
+
+print(xgb_model)
+
+
+
+
+rf_model$bestTune
+gbm_model$bestTune
+glm_model$bestTune
+svm_model$bestTune
+ann_model$bestTune
+xgb_model$params
+dt_model$bestTune
+
+
+rf_pred_train <- predict(rf_model, train_data_selected, type = "prob")[,2]
+rf_pred_test <- predict(rf_model, test_df, type = "prob")[,2]
+rf_pred_valid <- predict(rf_model, valid_df, type = "prob")[,2]
+gbm_pred_train <- predict(gbm_model, train_data_selected, type = "prob")[,2]
+gbm_pred_test <- predict(gbm_model, test_df, type = "prob")[,2]
+gbm_pred_valid <- predict(gbm_model, valid_df, type = "prob")[,2]
+glm_pred_test <- predict(glm_model, test_df, type = "prob")[,2]
+glm_pred_train <- predict(glm_model, train_data_selected, type = "prob")[,2]
+glm_pred_valid <- predict(glm_model, valid_df, type = "prob")[,2]
+svm_pred_train <- predict(svm_model, train_data_selected, type = "prob")[,2]
+svm_pred_test <- predict(svm_model, test_df, type = "prob")[,2]
+svm_pred_valid <- predict(svm_model, valid_df, type = "prob")[,2]
+dt_pred_train <- predict(dt_model, train_data_selected, type = "prob")[,2]
+dt_pred_test <- predict(dt_model, test_df, type = "prob")[,2]
+dt_pred_valid <- predict(dt_model, valid_df, type = "prob")[,2]
+ann_pred_train <- predict(ann_model, train_data_selected, type = "prob")[,2]
+ann_pred_test <- predict(ann_model, test_df, type = "prob")[,2]
+ann_pred_valid <- predict(ann_model, valid_df, type = "prob")[,2]
+
+
+xgb_pred_train <- predict(xgb_model, newdata = xgb.DMatrix(as.matrix(train_data_selected[, intersection_corrected])))
+xgb_pred_test <- predict(xgb_model, newdata = xgb.DMatrix(as.matrix(test_df[, intersection_corrected])))
+xgb_pred_valid <- predict(xgb_model, newdata = xgb.DMatrix(as.matrix(valid_df[, intersection_corrected])))
+
+
+evaluate_model <- function(model, pred_train, pred_test, pred_valid, train_data_selected, test_df, valid_df, response) {
+  train_data_selected[[response]] <- as.factor(train_data_selected[[response]])
+  test_df[[response]] <- as.factor(test_df[[response]])
+  valid_df[[response]] <- as.factor(valid_df[[response]])
+  
+  train_pred <- as.factor(ifelse(pred_train > 0.4, levels(train_data_selected[[response]])[2], levels(train_data_selected[[response]])[1]))
+  test_pred <- as.factor(ifelse(pred_test > 0.4, levels(test_df[[response]])[2], levels(test_df[[response]])[1]))
+  valid_pred <- as.factor(ifelse(pred_valid > 0.4, levels(valid_df[[response]])[2], levels(valid_df[[response]])[1]))
+  
+  train_confusion <- confusionMatrix(train_pred, train_data_selected[[response]])
+  test_confusion <- confusionMatrix(test_pred, test_df[[response]])
+  valid_confusion <- confusionMatrix(valid_pred, valid_df[[response]])
+  
+  precision_train <- posPredValue(train_pred, train_data_selected[[response]], positive = levels(train_data_selected[[response]])[2])
+  recall_train <- sensitivity(train_pred, train_data_selected[[response]], positive = levels(train_data_selected[[response]])[2])
+  f1_score_train <- 2 * (precision_train * recall_train) / (precision_train + recall_train)
+  
+  precision_test <- posPredValue(test_pred, test_df[[response]], positive = levels(test_df[[response]])[2])
+  recall_test <- sensitivity(test_pred, test_df[[response]], positive = levels(test_df[[response]])[2])
+  f1_score_test <- 2 * (precision_test * recall_test) / (precision_test + recall_test)
+  
+  precision_valid <- posPredValue(valid_pred, valid_df[[response]], positive = levels(valid_df[[response]])[2])
+  recall_valid <- sensitivity(valid_pred, valid_df[[response]], positive = levels(valid_df[[response]])[2])
+  f1_score_valid <- 2 * (precision_valid * recall_valid) / (precision_valid + recall_valid)
+  
+
+  specificity_train <- specificity(train_pred, train_data_selected[[response]], negative = levels(train_data_selected[[response]])[1])
+  specificity_test <- specificity(test_pred, test_df[[response]], negative = levels(test_df[[response]])[1])
+  specificity_valid <- specificity(valid_pred, valid_df[[response]], negative = levels(valid_df[[response]])[1])
+  npv_train <- negPredValue(train_pred, train_data_selected[[response]], negative = levels(train_data_selected[[response]])[1])
+  npv_test <- negPredValue(test_pred, test_df[[response]], negative = levels(test_df[[response]])[1])
+  npv_valid <- negPredValue(valid_pred, valid_df[[response]], negative = levels(valid_df[[response]])[1])
+  lr_plus_train <- recall_train / (1 - specificity_train)
+  lr_plus_test <- recall_test / (1 - specificity_test)
+  lr_plus_valid <- recall_valid / (1 - specificity_valid)
+  lr_minus_train <- (1 - recall_train) / specificity_train
+  lr_minus_test <- (1 - recall_test) / specificity_test
+  lr_minus_valid <- (1 - recall_valid) / specificity_valid
+  
+  metrics <- data.frame(
+    Model = model,
+    Accuracy_Train = train_confusion$overall['Accuracy'],
+    Precision_Train = precision_train,
+    Recall_Train = recall_train,
+    Specificity_Train = specificity_train,
+    NPV_Train = npv_train,
+    F1_Score_Train = f1_score_train,
+    AUC_Train = roc(train_data_selected[[response]], pred_train)$auc,
+    LR_Plus_Train = lr_plus_train,
+    LR_Minus_Train = lr_minus_train,
+    
+    Accuracy_test = test_confusion$overall['Accuracy'],
+    Precision_test = precision_test,
+    Recall_test = recall_test,
+    Specificity_test = specificity_test,
+    NPV_test = npv_test,
+    F1_Score_test = f1_score_test,
+    AUC_test = roc(test_df[[response]], pred_test)$auc,
+    LR_Plus_test = lr_plus_test,
+    LR_Minus_test = lr_minus_test,
+    
+    Accuracy_Valid = valid_confusion$overall['Accuracy'],
+    Precision_Valid = precision_valid,
+    Recall_Valid = recall_valid,
+    Specificity_Valid = specificity_valid,
+    NPV_Valid = npv_valid,
+    F1_Score_Valid = f1_score_valid,
+    AUC_Valid = roc(valid_df[[response]], pred_valid)$auc,
+    LR_Plus_Valid = lr_plus_valid,
+    LR_Minus_Valid = lr_minus_valid
+  )
+  return(metrics)
+}
+
+
+metrics_list <- list(
+  evaluate_model("RF", rf_pred_train, rf_pred_test, rf_pred_valid, train_data_selected,test_df, valid_df, response),
+  evaluate_model("GBM", gbm_pred_train, gbm_pred_test,gbm_pred_valid, train_data_selected, test_df, valid_df, response),
+  evaluate_model("GLM", glm_pred_train, glm_pred_test,glm_pred_valid, train_data_selected,test_df, valid_df, response),
+  evaluate_model("SVM", svm_pred_train, svm_pred_test,svm_pred_valid, train_data_selected,test_df, valid_df, response),
+  evaluate_model("DT", dt_pred_train,dt_pred_test, dt_pred_valid, train_data_selected, test_df,valid_df, response),
+  evaluate_model("ANN", ann_pred_train, ann_pred_test,ann_pred_valid, train_data_selected,test_df, valid_df, response),
+  evaluate_model("XGB", xgb_pred_train,xgb_pred_test, xgb_pred_valid, train_data_selected,test_df, valid_df, response)
+)
+
+
+metrics_df <- do.call(rbind, metrics_list)
+
+
+
+print(metrics_df)
+
+
+library(pROC)
+library(openxlsx)
+library(caret)
+library(boot)
+
+
+boot_ci_metric <- function(data, indices, pred, ref, metric_func) {
+  resample_pred <- pred[indices]
+  resample_ref <- ref[indices]
+  metric_func(resample_pred, resample_ref)
+}
+
+# 包装各类指标的Bootstrap CI计算
+get_ci <- function(pred, ref, metric_func, R = 1000, type = "perc") {
+  set.seed(123)
+  boot_obj <- boot(data = data.frame(pred, ref), 
+                   statistic = function(data, indices) {
+                     boot_ci_metric(data, indices, data$pred, data$ref, metric_func)
+                   },
+                   R = R)
+  boot.ci(boot_obj, type = type)$percent[4:5]
+}
+
+# 各类指标函数（用于Bootstrap）
+precision_func <- function(pred, ref) posPredValue(pred, ref, positive = levels(ref)[2])
+recall_func <- function(pred, ref) sensitivity(pred, ref, positive = levels(ref)[2])
+specificity_func <- function(pred, ref) specificity(pred, ref, negative = levels(ref)[1])
+npv_func <- function(pred, ref) negPredValue(pred, ref, negative = levels(ref)[1])
+f1_func <- function(pred, ref) {
+  p <- posPredValue(pred, ref, positive = levels(ref)[2])
+  r <- sensitivity(pred, ref, positive = levels(ref)[2])
+  2 * p * r / (p + r)
+}
+accuracy_func <- function(pred, ref) {
+  sum(pred == ref) / length(ref)
+}
+
+# 主函数（含指标和CI计算）
+evaluate_model_with_all_ci <- function(model, pred, true, response) {
+  true[[response]] <- as.factor(true[[response]])
+  pred_prob <- pred
+  pred_label <- as.factor(ifelse(pred_prob > 0.4, levels(true[[response]])[2], levels(true[[response]])[1]))
+  ref <- true[[response]]
+  
+  auc_obj <- roc(ref, pred_prob)
+  auc_ci <- ci.auc(auc_obj)
+  
+  precision <- precision_func(pred_label, ref)
+  recall <- recall_func(pred_label, ref)
+  specificity <- specificity_func(pred_label, ref)
+  npv <- npv_func(pred_label, ref)
+  f1 <- f1_func(pred_label, ref)
+  accuracy <- accuracy_func(pred_label, ref)
+  
+  ci_precision <- get_ci(pred_label, ref, precision_func)
+  ci_recall <- get_ci(pred_label, ref, recall_func)
+  ci_specificity <- get_ci(pred_label, ref, specificity_func)
+  ci_npv <- get_ci(pred_label, ref, npv_func)
+  ci_f1 <- get_ci(pred_label, ref, f1_func)
+  ci_accuracy <- get_ci(pred_label, ref, accuracy_func)
+  
+  data.frame(
+    Model = model,
+    AUC = auc_obj$auc,
+    AUC_CI_Lower = auc_ci[1],
+    AUC_CI_Upper = auc_ci[3],
+    
+    Precision = precision,
+    Precision_CI_Lower = ci_precision[1],
+    Precision_CI_Upper = ci_precision[2],
+    
+    Recall = recall,
+    Recall_CI_Lower = ci_recall[1],
+    Recall_CI_Upper = ci_recall[2],
+    
+    Specificity = specificity,
+    Specificity_CI_Lower = ci_specificity[1],
+    Specificity_CI_Upper = ci_specificity[2],
+    
+    NPV = npv,
+    NPV_CI_Lower = ci_npv[1],
+    NPV_CI_Upper = ci_npv[2],
+    
+    F1 = f1,
+    F1_CI_Lower = ci_f1[1],
+    F1_CI_Upper = ci_f1[2],
+    
+    Accuracy = accuracy,
+    Accuracy_CI_Lower = ci_accuracy[1],
+    Accuracy_CI_Upper = ci_accuracy[2]
+  )
+}
+
+# 批量评估模型
+results_all <- list(
+  evaluate_model_with_all_ci("RF_Train", rf_pred_train, train_data_selected, response),
+  evaluate_model_with_all_ci("RF_Test", rf_pred_test, test_df, response),
+  evaluate_model_with_all_ci("RF_Valid", rf_pred_valid, valid_df, response),
+  
+  evaluate_model_with_all_ci("GBM_Train", gbm_pred_train, train_data_selected, response),
+  evaluate_model_with_all_ci("GBM_Test", gbm_pred_test, test_df, response),
+  evaluate_model_with_all_ci("GBM_Valid", gbm_pred_valid, valid_df, response),
+  
+  evaluate_model_with_all_ci("GLM_Train", glm_pred_train, train_data_selected, response),
+  evaluate_model_with_all_ci("GLM_Test", glm_pred_test, test_df, response),
+  evaluate_model_with_all_ci("GLM_Valid", glm_pred_valid, valid_df, response),
+  
+  evaluate_model_with_all_ci("SVM_Train", svm_pred_train, train_data_selected, response),
+  evaluate_model_with_all_ci("SVM_Test", svm_pred_test, test_df, response),
+  evaluate_model_with_all_ci("SVM_Valid", svm_pred_valid, valid_df, response),
+  
+  evaluate_model_with_all_ci("DT_Train", dt_pred_train, train_data_selected, response),
+  evaluate_model_with_all_ci("DT_Test", dt_pred_test, test_df, response),
+  evaluate_model_with_all_ci("DT_Valid", dt_pred_valid, valid_df, response),
+  
+  evaluate_model_with_all_ci("ANN_Train", ann_pred_train, train_data_selected, response),
+  evaluate_model_with_all_ci("ANN_Test", ann_pred_test, test_df, response),
+  evaluate_model_with_all_ci("ANN_Valid", ann_pred_valid, valid_df, response),
+  
+  evaluate_model_with_all_ci("XGB_Train", xgb_pred_train, train_data_selected, response),
+  evaluate_model_with_all_ci("XGB_Test", xgb_pred_test, test_df, response),
+  evaluate_model_with_all_ci("XGB_Valid", xgb_pred_valid, valid_df, response)
+)
+
+
+results_df <- do.call(rbind, results_all)
+
+
+print(results_df)
+
+format_ci <- function(mean, lower, upper, digits = 3) {
+  mean_fmt <- formatC(mean, format = "f", digits = digits)
+  lower_fmt <- formatC(lower, format = "f", digits = digits)
+  upper_fmt <- formatC(upper, format = "f", digits = digits)
+  paste0(mean_fmt, " [", lower_fmt, "–", upper_fmt, "]")
+}
+
+results_df_formatted <- data.frame(
+  Model = results_df$Model,
+  AUC = mapply(format_ci, results_df$AUC, results_df$AUC_CI_Lower, results_df$AUC_CI_Upper),
+  Precision = mapply(format_ci, results_df$Precision, results_df$Precision_CI_Lower, results_df$Precision_CI_Upper),
+  Recall = mapply(format_ci, results_df$Recall, results_df$Recall_CI_Lower, results_df$Recall_CI_Upper),
+  Specificity = mapply(format_ci, results_df$Specificity, results_df$Specificity_CI_Lower, results_df$Specificity_CI_Upper),
+  NPV = mapply(format_ci, results_df$NPV, results_df$NPV_CI_Lower, results_df$NPV_CI_Upper),
+  F1 = mapply(format_ci, results_df$F1, results_df$F1_CI_Lower, results_df$F1_CI_Upper),
+  Accuracy = mapply(format_ci, results_df$Accuracy, results_df$Accuracy_CI_Lower, results_df$Accuracy_CI_Upper)
+)
+
+
+
+
+print(results_df_formatted)
+
+
+
+
