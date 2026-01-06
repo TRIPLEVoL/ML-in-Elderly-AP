@@ -1,0 +1,133 @@
+
+library(shiny)
+library(xgboost)
+library(DT)
+library(bslib)
+library(shinyWidgets)
+library(here)  
+
+
+
+
+# Load model
+xgb_model <- xgb.load("xgb_model_final.model")
+
+
+# ------------------- UI -------------------
+ui <- fluidPage(
+  theme = bs_theme(bootswatch = "flatly"),
+  
+  titlePanel(
+    h2("Prediction of In-Hospital Mortality in Elderly Patients with Acute Pancreatitis (XGBoost)",
+       style = "margin-bottom: 30px; font-weight: bold; color: #2c3e50;")
+  ),
+  
+  fluidRow(
+    column(4,
+           h4("➤ Input Patient Data", style = "margin-bottom: 20px;"),
+           
+           numericInput("Leukocyte.count", "Leukocyte Count (10⁹/L)", value = 10, min = 0, max = 100),
+           selectInput("Vasoactive.drug", "Vasoactive Drug", choices = c("No" = 0, "Yes" = 1)),
+           numericInput("Hospital.stay", "Length of Hospital Stay (Days)", value = 7, min = 0, max = 100),
+           selectInput("Noninvasive.ventilation", "Noninvasive Ventilation", choices = c("No" = 0, "Yes" = 1)),
+           selectInput("IMV", "Invasive Mechanical Ventilation", choices = c("No" = 0, "Yes" = 1)),
+           
+           actionBttn("predict", "Run Prediction", style = "jelly", color = "primary", block = TRUE)
+    ),
+    
+    column(8,
+           h4("➤ Prediction Result", style = "margin-bottom: 20px;"),
+           uiOutput("result_card"),
+           
+           # ===== Model Notes =====
+           div(
+             h5("Model Notes", style = "margin-top: 30px; font-weight: bold;"),
+             tags$ul(
+               tags$li("This model is based on retrospective data using the XGBoost algorithm."),
+               tags$li("Risk thresholds are defined as:"),
+               tags$ul(
+                 tags$li("Low risk: predicted probability < 0.2"),
+                 tags$li("Intermediate risk: 0.2 ≤ probability < 0.5"),
+                 tags$li("High risk: probability ≥ 0.5")
+               ),
+               tags$li("Predictions represent probabilistic estimates and should be interpreted as decision support rather than definitive clinical outcomes.")
+             ),
+             style = "background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 20px;"
+           ),
+           
+           # ===== Disclaimer =====
+           div(
+             h5("Disclaimer", style = "margin-top: 20px; font-weight: bold;"),
+             tags$p(
+               "This tool is intended for research and clinical decision support purposes only and does not replace professional clinical judgment. No user-identifiable information is stored or transmitted."
+             ),
+             style = "background-color: #fff3cd; padding: 12px; border-radius: 8px; font-size: 0.9em;"
+           ),
+           
+           h4("➤ Input Summary", style = "margin-top: 30px;"),
+           DTOutput("input_table")
+    )
+    
+  )
+)
+
+# ------------------- Server -------------------
+server <- function(input, output) {
+  
+  observeEvent(input$predict, {
+    
+    # 原始数据（保持和模型训练时一致的列名）
+    new_data <- data.frame(
+      Leukocyte.count = input$Leukocyte.count,
+      Vasoactive.drug = as.numeric(input$Vasoactive.drug),
+      Hospital.stay = input$Hospital.stay,
+      Noninvasive.ventilation = as.numeric(input$Noninvasive.ventilation),
+      IMV = as.numeric(input$IMV)
+    )
+    
+    # --- 模型预测 ---
+    dnew <- xgb.DMatrix(as.matrix(new_data))
+    pred_prob <- predict(xgb_model, dnew)  # ⚠️ 请确保你已经在全局环境里加载了训练好的 xgb_model
+    
+    pred_label <- ifelse(pred_prob < 0.2, "Low Risk",
+                         ifelse(pred_prob < 0.5, "Intermediate Risk", 
+                                "High Risk"))
+    
+    risk_color <- ifelse(pred_label == "Low Risk", "#27ae60",
+                         ifelse(pred_label == "Intermediate Risk", "#f39c12", "#e74c3c"))
+    
+    output$result_card <- renderUI({
+      div(style = paste0("background-color: #f8f9fa; border-left: 5px solid ", risk_color, 
+                         "; padding: 20px; border-radius: 10px;"),
+          h5("Predicted Mortality Probability:", style = "color: #333;"),
+          h3(paste0(round(pred_prob, 4)), style = "color: #007bff; font-weight: bold;"),
+          h5("Risk Stratification:", style = "color: #333;"),
+          h3(pred_label, style = paste0("color: ", risk_color, "; font-weight: bold;"))
+      )
+    })
+    
+    # --- Input Summary（改列名显示）---
+    pretty_names <- c(
+      "Leukocyte Count (10⁹/L)",
+      "Vasoactive Drug",
+      "Length of Hospital Stay (Days)",
+      "Noninvasive Ventilation",
+      "Invasive Mechanical Ventilation"
+    )
+    
+    output$input_table <- renderDT({
+      datatable(
+        setNames(new_data, pretty_names),
+        options = list(dom = 't', paging = FALSE),
+        rownames = FALSE
+      )
+    })
+  })
+}
+
+# ------------------- Run App -------------------
+shinyApp(ui = ui, server = server)
+
+
+
+
